@@ -1,0 +1,82 @@
+name: Fidelly Prospection
+
+on:
+  workflow_dispatch:
+    inputs:
+      zones:
+        description: 'Zones, séparées par |'
+        required: true
+        default: 'Issoudun'
+      keywords:
+        description: 'Activités, séparées par |'
+        required: true
+        default: 'caviste|restaurant'
+      max_prospects:
+        description: 'Nombre maximum de prospects'
+        required: true
+        default: '30'
+      pages:
+        description: 'Pages Annuaire Entreprises'
+        required: true
+        default: '2'
+
+jobs:
+  prospect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build CLI arguments
+        id: args
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          zones = os.environ["ZONES"].split("|")
+          keywords = os.environ["KEYWORDS"].split("|")
+
+          def q(items):
+              return " ".join(
+                  "'" + x.replace("'", "'\"'\"'") + "'"
+                  for x in items if x.strip()
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("zones=" + q(zones) + "\n")
+              f.write("keywords=" + q(keywords) + "\n")
+          PY
+        env:
+          ZONES: ${{ github.event.inputs.zones || 'Issoudun' }}
+          KEYWORDS: ${{ github.event.inputs.keywords || 'caviste|restaurant' }}
+
+      - name: Run Fidelly Prospect Finder
+        env:
+          SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
+          SHEETS_WEBHOOK_TOKEN: ${{ secrets.SHEETS_WEBHOOK_TOKEN }}
+        shell: bash
+        run: |
+          eval python fidelly_prospect_finder_v6_cloud.py \
+            --zones ${{ steps.args.outputs.zones }} \
+            --keywords ${{ steps.args.outputs.keywords }} \
+            --pages "${{ github.event.inputs.pages || '2' }}" \
+            --max-prospects "${{ github.event.inputs.max_prospects || '30' }}" \
+            --output fidelly_prospects.csv \
+            --push-sheets
+
+      - name: Keep CSV as GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fidelly-prospects
+          path: fidelly_prospects.csv
+          retention-days: 30
