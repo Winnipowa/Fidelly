@@ -1,0 +1,35 @@
+FIDELLY PROSPECT FINDER V7 RESILIENT
+
+À mettre dans le repo Winnipowa/Fidelly :
+
+1) Ajouter à la racine :
+   fidelly_prospect_finder_v7_resilient.py
+
+2) Remplacer :
+   .github/workflows/fidelly-prospection.yml
+   par le fichier fourni dans le ZIP.
+
+Conserver à la racine :
+   fidelly_prospect_finder_v6_cloud.py
+   requirements.txt
+
+La V7 importe la V6 comme moteur, puis ajoute :
+- 1 job GitHub séparé par ville, exécuté séquentiellement (max-parallel: 1)
+- fail-fast: false : une ville en erreur n'annule pas les suivantes
+- limite de prospects PAR VILLE
+- activités multi-mots conservées (ex: institut de beauté)
+- suppression automatique des libellés accidentels "Zones" / "Activités"
+- répartition équitable des prospects entre activités
+- erreur isolée prospect par prospect
+- CSV écrit après chaque prospect
+- push Google Sheets par checkpoint (5 par défaut)
+- 5 retries exponentiels en cas de panne Sheets
+- fichier .pending.json si un lot Sheets reste à envoyer
+- garde-fou à 160 min avant le timeout GitHub de 180 min
+
+Réglage conseillé :
+Zones : Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|Saint-Amand-Montrond
+Activités : restaurant|café|bar|caviste|coiffeur|barbier|institut de beauté|CBD|fleuriste|animalerie|boulangerie
+Maximum par ville : 50
+Pages : 2
+Checkpoint : 5
