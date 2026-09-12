@@ -1,4 +1,4 @@
-name: Fidelly Prospection V7 Resilient
+name: Fidelly Prospection V8 Smart Incremental
 
 on:
   workflow_dispatch:
@@ -8,11 +8,11 @@ on:
         required: true
         default: 'Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|Saint-Amand-Montrond'
       keywords:
-        description: 'Activités séparées par | (les espaces sont conservés)'
+        description: 'Activités séparées par | (espaces conservés)'
         required: true
         default: 'restaurant|café|bar|caviste|coiffeur|barbier|institut de beauté|CBD|fleuriste|animalerie|boulangerie'
       max_prospects_per_city:
-        description: 'Maximum par ville'
+        description: 'Maximum de prospects découverts par ville'
         required: true
         default: '50'
       pages:
@@ -20,9 +20,21 @@ on:
         required: true
         default: '2'
       checkpoint_every:
-        description: 'Envoi Google Sheets toutes les N fiches'
+        description: 'Envoi Google Sheets toutes les N fiches enrichies'
         required: true
         default: '5'
+      force_refresh:
+        description: 'Forcer le contrôle des fiches déjà connues'
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: fidelly-prospection
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   prepare:
@@ -39,15 +51,14 @@ jobs:
           python - <<'PY'
           import json, os
           ignored = {'zone','zones','ville','villes'}
-          zones = []
-          seen = set()
+          zones, seen = [], set()
           for raw in os.environ['ZONES'].split('|'):
               z = raw.strip()
               if not z or z.lower() in ignored:
                   continue
-              k = z.casefold()
-              if k not in seen:
-                  seen.add(k)
+              key = z.casefold()
+              if key not in seen:
+                  seen.add(key)
                   zones.append(z)
           if not zones:
               raise SystemExit('Aucune ville valide')
@@ -78,34 +89,56 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run resilient city scan
+      - name: Run V8 smart incremental scan
         env:
           ZONE: ${{ matrix.zone }}
           KEYWORDS: ${{ github.event.inputs.keywords }}
           MAX_PROSPECTS: ${{ github.event.inputs.max_prospects_per_city }}
           PAGES: ${{ github.event.inputs.pages }}
           CHECKPOINT_EVERY: ${{ github.event.inputs.checkpoint_every }}
+          FORCE_REFRESH: ${{ github.event.inputs.force_refresh }}
           SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
           SHEETS_WEBHOOK_TOKEN: ${{ secrets.SHEETS_WEBHOOK_TOKEN }}
         shell: bash
         run: |
-          python fidelly_prospect_finder_v7_resilient.py \
+          EXTRA_ARGS=""
+          if [ "$FORCE_REFRESH" = "true" ]; then
+            EXTRA_ARGS="--force-refresh"
+          fi
+
+          python fidelly_prospect_finder_v8_smart.py \
             --zones-pipe "$ZONE" \
             --keywords-pipe "$KEYWORDS" \
             --pages "$PAGES" \
             --max-prospects-per-zone "$MAX_PROSPECTS" \
             --checkpoint-every "$CHECKPOINT_EVERY" \
             --max-runtime-minutes 160 \
+            --actionable-refresh-days 60 \
+            --partial-refresh-days 14 \
+            --empty-refresh-days 7 \
             --output fidelly_prospects.csv \
-            --push-sheets
+            --push-sheets \
+            $EXTRA_ARGS
 
-      - name: Keep CSV and pending checkpoints
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f fidelly_prospects.summary.json ]; then
+            echo '## Fidelly V8 — résumé' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat fidelly_prospects.summary.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep CSV, summary and pending checkpoints
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fidelly-prospects-${{ strategy.job-index }}
           path: |
             fidelly_prospects.csv
+            fidelly_prospects.summary.json
             fidelly_prospects.pending.json
           if-no-files-found: ignore
           retention-days: 30
