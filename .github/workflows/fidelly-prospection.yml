@@ -1,30 +1,38 @@
-name: Fidelly Prospection V8 Smart Incremental
+name: Fidelly Prospection V9 New-First
 
 on:
   workflow_dispatch:
     inputs:
       zones:
-        description: 'Villes séparées par |'
+        description: 'Villes / arrondissements séparés par |'
         required: true
-        default: 'Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|Saint-Amand-Montrond'
+        default: 'Lyon'
       keywords:
-        description: 'Activités séparées par | (espaces conservés)'
+        description: 'Activités séparées par |'
         required: true
-        default: 'restaurant|café|bar|caviste|coiffeur|barbier|institut de beauté|CBD|fleuriste|animalerie|boulangerie'
-      max_prospects_per_city:
-        description: 'Maximum de prospects découverts par ville'
+        default: 'restaurant|bar|caviste|coiffeur|institut de beauté|fleuriste|animalerie|boulangerie|pâtisserie|épicerie|primeur|boucherie|poissonnerie|librairie|magasin de vêtements|chaussures|bijouterie|opticien|photographe|salle de sport|spa|tatoueur|toilettage|CBD'
+      target_new_per_city:
+        description: 'Objectif de NOUVEAUX prospects uniques par ville'
         required: true
-        default: '50'
+        default: '100'
       pages:
         description: 'Pages Annuaire Entreprises par activité'
         required: true
-        default: '2'
+        default: '5'
+      discovery_multiplier:
+        description: 'Largeur du vivier (8 = cherche jusqu’à ~8x la cible)'
+        required: true
+        default: '8'
+      max_enrich_per_run:
+        description: 'Maximum de fiches enrichies par ville et par run'
+        required: true
+        default: '100'
       checkpoint_every:
         description: 'Envoi Google Sheets toutes les N fiches enrichies'
         required: true
         default: '5'
       force_refresh:
-        description: 'Forcer le contrôle des fiches déjà connues'
+        description: 'Forcer le retraitement des anciens prospects'
         required: true
         type: boolean
         default: false
@@ -89,12 +97,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run V8 smart incremental scan
+      - name: Run V9 New-First
         env:
           ZONE: ${{ matrix.zone }}
           KEYWORDS: ${{ github.event.inputs.keywords }}
-          MAX_PROSPECTS: ${{ github.event.inputs.max_prospects_per_city }}
+          TARGET_NEW: ${{ github.event.inputs.target_new_per_city }}
           PAGES: ${{ github.event.inputs.pages }}
+          DISCOVERY_MULTIPLIER: ${{ github.event.inputs.discovery_multiplier }}
+          MAX_ENRICH: ${{ github.event.inputs.max_enrich_per_run }}
           CHECKPOINT_EVERY: ${{ github.event.inputs.checkpoint_every }}
           FORCE_REFRESH: ${{ github.event.inputs.force_refresh }}
           SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
@@ -106,26 +116,14 @@ jobs:
             EXTRA_ARGS="--force-refresh"
           fi
 
-          python fidelly_prospect_finder_v8_smart.py \
-            --zones-pipe "$ZONE" \
-            --keywords-pipe "$KEYWORDS" \
-            --pages "$PAGES" \
-            --max-prospects-per-zone "$MAX_PROSPECTS" \
-            --checkpoint-every "$CHECKPOINT_EVERY" \
-            --max-runtime-minutes 160 \
-            --actionable-refresh-days 60 \
-            --partial-refresh-days 14 \
-            --empty-refresh-days 7 \
-            --output fidelly_prospects.csv \
-            --push-sheets \
-            $EXTRA_ARGS
+          python fidelly_prospect_finder_v9_new_first.py             --zones-pipe "$ZONE"             --keywords-pipe "$KEYWORDS"             --pages "$PAGES"             --target-new-per-zone "$TARGET_NEW"             --discovery-multiplier "$DISCOVERY_MULTIPLIER"             --max-enrich-per-run "$MAX_ENRICH"             --checkpoint-every "$CHECKPOINT_EVERY"             --max-runtime-minutes 160             --output fidelly_prospects.csv             --push-sheets             $EXTRA_ARGS
 
       - name: Job summary
         if: always()
         shell: bash
         run: |
           if [ -f fidelly_prospects.summary.json ]; then
-            echo '## Fidelly V8 — résumé' >> "$GITHUB_STEP_SUMMARY"
+            echo '## Fidelly V9 — New-First' >> "$GITHUB_STEP_SUMMARY"
             echo '```json' >> "$GITHUB_STEP_SUMMARY"
             cat fidelly_prospects.summary.json >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -135,7 +133,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fidelly-prospects-${{ strategy.job-index }}
+          name: fidelly-v9-${{ strategy.job-index }}
           path: |
             fidelly_prospects.csv
             fidelly_prospects.summary.json
