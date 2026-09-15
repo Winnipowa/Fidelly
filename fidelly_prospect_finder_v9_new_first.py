@@ -7,18 +7,22 @@ But:
 - ne pas gaspiller du temps sur les prospects déjà actionnables ;
 - enregistrer immédiatement les nouveaux dans Google Sheets ;
 - enrichir les nouveaux avant tout ancien prospect ;
-- supporter Paris/Lyon/Marseille par arrondissement.
+- supporter Paris/Lyon/Marseille par arrondissement ;
+- permettre un mode "tous les métiers" basé sur les 732 sous-classes NAF.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import time
+from collections import defaultdict, deque
+from pathlib import Path
 
 import fidelly_prospect_finder_v8_smart as core
 
-VERSION = "9.0"
+VERSION = "9.1"
 ORIGINAL_RESOLVE = core.v6.resolve_zone
 
 
@@ -63,6 +67,157 @@ def smart_resolve(zone: str):
     return ORIGINAL_RESOLVE(z)
 
 
+def load_business_categories(path: str) -> dict[str, dict]:
+    """Charge la taxonomie NAF, et la génère si elle n'existe pas encore."""
+    p = Path(path)
+
+    if not p.exists():
+        print(
+            f"{p} absent : génération de la taxonomie NAF depuis la source INSEE...",
+            flush=True,
+        )
+        try:
+            import build_business_categories as builder
+
+            xml_bytes = builder.read_source(None)
+            rows = builder.parse_naf_subclasses(xml_bytes)
+            if len(rows) != builder.EXPECTED_COUNT:
+                raise RuntimeError(
+                    f"{len(rows)} sous-classes reçues au lieu de "
+                    f"{builder.EXPECTED_COUNT}"
+                )
+            data = builder.build_dataset(rows)
+            p.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            raise SystemExit(
+                "Impossible de générer business_categories.json. "
+                "Exécute d'abord `python build_business_categories.py` "
+                f"ou fournis --business-categories. Détail: {exc}"
+            ) from exc
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"Taxonomie NAF invalide ({p}): {exc}") from exc
+
+    valid = {
+        str(code).upper(): value
+        for code, value in data.items()
+        if re.fullmatch(r"\d{2}\.\d{2}[A-Z]", str(code).upper())
+        and isinstance(value, dict)
+    }
+    if not valid:
+        raise SystemExit(f"Aucune activité NAF valide dans {p}.")
+
+    return valid
+
+
+def balanced_naf_codes(categories: dict[str, dict]) -> list[str]:
+    """Entrelace les divisions NAF pour éviter un scan biaisé secteur par secteur."""
+    buckets: dict[str, deque[str]] = defaultdict(deque)
+    for code in sorted(categories):
+        buckets[code[:2]].append(code)
+
+    divisions = sorted(buckets)
+    result: list[str] = []
+    while True:
+        added = False
+        for division in divisions:
+            if buckets[division]:
+                result.append(buckets[division].popleft())
+                added = True
+        if not added:
+            break
+    return result
+
+
+def category_label(code: str, categories: dict[str, dict]) -> str:
+    meta = categories.get(code.upper()) or {}
+    label = core.norm(meta.get("category"))
+    if label:
+        return label
+    keywords = meta.get("keywords") or []
+    return core.norm(keywords[0]) if keywords else f"NAF {code}"
+
+
+def discover_zone_all_businesses(
+    zone: str,
+    categories: dict[str, dict],
+    max_prospects: int,
+    max_per_naf: int = 4,
+) -> tuple[str, list[dict]]:
+    """Découvre un éventail large d'établissements en parcourant tous les codes NAF.
+
+    Une seule page API est demandée par code NAF et on limite le nombre retenu par
+    code afin de privilégier la diversité des métiers plutôt qu'un secteur dominant.
+    """
+    try:
+        communes = core.v6.resolve_zone(zone)
+    except Exception as exc:
+        print(f"! Commune {zone}: {exc}", flush=True)
+        return zone, []
+
+    if not communes:
+        print(f"! Commune introuvable: {zone}", flush=True)
+        return zone, []
+
+    commune = communes[0]
+    zone_name = commune.get("nom", zone)
+    postcodes = commune.get("codesPostaux") or []
+    print(f"=== {zone_name} : {', '.join(postcodes)} ===", flush=True)
+    print(
+        f"  Mode TOUS LES MÉTIERS : {len(categories)} codes NAF disponibles",
+        flush=True,
+    )
+
+    rows: list[dict] = []
+    global_seen = set()
+    ordered_codes = balanced_naf_codes(categories)
+    max_per_naf = max(1, int(max_per_naf))
+
+    for cp in postcodes[:3]:
+        if len(rows) >= max_prospects:
+            break
+
+        for idx, naf in enumerate(ordered_codes, 1):
+            if len(rows) >= max_prospects:
+                break
+
+            label = category_label(naf, categories)
+            if idx == 1 or idx % 50 == 0:
+                print(
+                    f"  -> progression {idx}/{len(ordered_codes)} codes NAF "
+                    f"| {len(rows)}/{max_prospects} prospects",
+                    flush=True,
+                )
+
+            kept_for_naf = 0
+            try:
+                # Le filtre NAF suffit : le texte n'est utilisé que comme label local.
+                for item in core.v6.gov_search(cp, label, naf, pages=1):
+                    key = item.get("siret") or (item.get("name"), item.get("address"))
+                    if not key or key in global_seen:
+                        continue
+                    global_seen.add(key)
+                    rows.append(core.empty_row(zone_name, label, item))
+                    kept_for_naf += 1
+
+                    if kept_for_naf >= max_per_naf or len(rows) >= max_prospects:
+                        break
+            except Exception as exc:
+                print(f"    ! découverte NAF {naf}: {exc}", flush=True)
+
+    print(
+        f"{len(rows)} établissements retenus pour {zone_name} "
+        f"(tous métiers).\n",
+        flush=True,
+    )
+    return zone_name, rows
+
+
 def push_batches(rows, url, token, batch_size=100):
     synced, failed = 0, []
     for start in range(0, len(rows), batch_size):
@@ -91,7 +246,27 @@ def never_enriched(existing):
 def main():
     p = argparse.ArgumentParser(description="Fidelly V9 New-First")
     p.add_argument("--zones-pipe", required=True)
-    p.add_argument("--keywords-pipe", required=True)
+    p.add_argument(
+        "--keywords-pipe",
+        default="",
+        help="Activités séparées par |. Facultatif avec --all-businesses.",
+    )
+    p.add_argument(
+        "--all-businesses",
+        action="store_true",
+        help="Parcourt toute la taxonomie NAF au lieu d'une liste de mots-clés.",
+    )
+    p.add_argument(
+        "--business-categories",
+        default="business_categories.json",
+        help="Fichier JSON généré par build_business_categories.py.",
+    )
+    p.add_argument(
+        "--max-per-naf",
+        type=int,
+        default=4,
+        help="En mode tous métiers, maximum retenu par code NAF et code postal.",
+    )
     p.add_argument("--pages", type=int, default=5)
     p.add_argument("--target-new-per-zone", type=int, default=100)
     p.add_argument("--discovery-multiplier", type=int, default=8)
@@ -106,8 +281,17 @@ def main():
 
     zones = core.split_pipe(args.zones_pipe)
     keywords = core.split_pipe(args.keywords_pipe)
-    if not zones or not keywords:
-        raise SystemExit("Zones/activités invalides.")
+    categories: dict[str, dict] = {}
+
+    if args.all_businesses:
+        categories = load_business_categories(args.business_categories)
+
+    if not zones:
+        raise SystemExit("Zones invalides.")
+    if not args.all_businesses and not keywords:
+        raise SystemExit(
+            "Aucune activité valide. Utilise --keywords-pipe ou --all-businesses."
+        )
 
     target = max(1, args.target_new_per_zone)
     discovery_cap = min(
@@ -127,6 +311,9 @@ def main():
     stats = {
         "version": VERSION,
         "started_at": core.utc_now_iso(),
+        "mode": "all_businesses" if args.all_businesses else "keywords",
+        "naf_categories": len(categories) if args.all_businesses else 0,
+        "keywords": keywords if not args.all_businesses else [],
         "target_new_per_zone": target,
         "discovery_cap_per_zone": discovery_cap,
         "new_selected": 0,
@@ -138,8 +325,14 @@ def main():
         "zones": {},
     }
 
+    mode_label = (
+        f"TOUS MÉTIERS ({len(categories)} NAF)"
+        if args.all_businesses
+        else f"{len(keywords)} activités ciblées"
+    )
     print(
-        f"[Fidelly V9 NEW-FIRST] objectif nouveaux/zone={target} | "
+        f"[Fidelly V9.1 NEW-FIRST] mode={mode_label} | "
+        f"objectif nouveaux/zone={target} | "
         f"vivier/zone={discovery_cap} | enrich max/run={max_enrich}",
         flush=True,
     )
@@ -148,12 +341,20 @@ def main():
         if time.monotonic() >= deadline:
             break
 
-        zone_name, candidates = core.discover_zone(
-            zone,
-            keywords,
-            max(1, args.pages),
-            discovery_cap,
-        )
+        if args.all_businesses:
+            zone_name, candidates = discover_zone_all_businesses(
+                zone,
+                categories,
+                discovery_cap,
+                max_per_naf=args.max_per_naf,
+            )
+        else:
+            zone_name, candidates = core.discover_zone(
+                zone,
+                keywords,
+                max(1, args.pages),
+                discovery_cap,
+            )
 
         if not candidates:
             stats["zones"][zone] = {"candidates": 0, "new": 0}
@@ -312,7 +513,7 @@ def main():
 
     print("=" * 78)
     print(
-        f"V9 terminé — nouveaux={stats['new_selected']} | "
+        f"V9.1 terminé — nouveaux={stats['new_selected']} | "
         f"enregistrés={stats['new_registered']} | "
         f"enrichis={stats['enriched']} | "
         f"anciens ignorés={stats['known_skipped']}"
