@@ -7,16 +7,21 @@ on:
         description: 'Villes / arrondissements séparés par |'
         required: true
         default: 'Lyon'
-      keywords:
-        description: 'Activités séparées par |'
+      all_businesses:
+        description: 'Scanner tous les métiers (732 activités NAF)'
         required: true
-        default: 'restaurant|bar|caviste|coiffeur|institut de beauté|fleuriste|animalerie|boulangerie|pâtisserie|épicerie|primeur|boucherie|poissonnerie|librairie|magasin de vêtements|chaussures|bijouterie|opticien|photographe|salle de sport|spa|tatoueur|toilettage|CBD'
+        type: boolean
+        default: true
+      keywords:
+        description: 'Sinon: activités séparées par |'
+        required: false
+        default: ''
       target_new_per_city:
         description: 'Objectif de NOUVEAUX prospects uniques par ville'
         required: true
         default: '100'
       pages:
-        description: 'Pages Annuaire Entreprises par activité'
+        description: 'Pages Annuaire Entreprises par activité (mode ciblé)'
         required: true
         default: '5'
       discovery_multiplier:
@@ -31,6 +36,10 @@ on:
         description: 'Envoi Google Sheets toutes les N fiches enrichies'
         required: true
         default: '5'
+      max_per_naf:
+        description: 'Mode tous métiers: max prospects retenus par code NAF'
+        required: true
+        default: '4'
       force_refresh:
         description: 'Forcer le retraitement des anciens prospects'
         required: true
@@ -97,26 +106,51 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Build full NAF taxonomy
+        if: ${{ github.event.inputs.all_businesses == 'true' }}
+        run: python build_business_categories.py -o business_categories.json
+
       - name: Run V9 New-First
         env:
           ZONE: ${{ matrix.zone }}
+          ALL_BUSINESSES: ${{ github.event.inputs.all_businesses }}
           KEYWORDS: ${{ github.event.inputs.keywords }}
           TARGET_NEW: ${{ github.event.inputs.target_new_per_city }}
           PAGES: ${{ github.event.inputs.pages }}
           DISCOVERY_MULTIPLIER: ${{ github.event.inputs.discovery_multiplier }}
           MAX_ENRICH: ${{ github.event.inputs.max_enrich_per_run }}
           CHECKPOINT_EVERY: ${{ github.event.inputs.checkpoint_every }}
+          MAX_PER_NAF: ${{ github.event.inputs.max_per_naf }}
           FORCE_REFRESH: ${{ github.event.inputs.force_refresh }}
           SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
           SHEETS_WEBHOOK_TOKEN: ${{ secrets.SHEETS_WEBHOOK_TOKEN }}
         shell: bash
         run: |
           EXTRA_ARGS=""
+
           if [ "$FORCE_REFRESH" = "true" ]; then
-            EXTRA_ARGS="--force-refresh"
+            EXTRA_ARGS="$EXTRA_ARGS --force-refresh"
           fi
 
-          python fidelly_prospect_finder_v9_new_first.py             --zones-pipe "$ZONE"             --keywords-pipe "$KEYWORDS"             --pages "$PAGES"             --target-new-per-zone "$TARGET_NEW"             --discovery-multiplier "$DISCOVERY_MULTIPLIER"             --max-enrich-per-run "$MAX_ENRICH"             --checkpoint-every "$CHECKPOINT_EVERY"             --max-runtime-minutes 160             --output fidelly_prospects.csv             --push-sheets             $EXTRA_ARGS
+          if [ "$ALL_BUSINESSES" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --all-businesses --business-categories business_categories.json --max-per-naf $MAX_PER_NAF"
+          elif [ -z "${KEYWORDS// }" ]; then
+            echo "Erreur: renseigne keywords ou active 'Scanner tous les métiers'."
+            exit 2
+          fi
+
+          python fidelly_prospect_finder_v9_new_first.py \
+            --zones-pipe "$ZONE" \
+            --keywords-pipe "$KEYWORDS" \
+            --pages "$PAGES" \
+            --target-new-per-zone "$TARGET_NEW" \
+            --discovery-multiplier "$DISCOVERY_MULTIPLIER" \
+            --max-enrich-per-run "$MAX_ENRICH" \
+            --checkpoint-every "$CHECKPOINT_EVERY" \
+            --max-runtime-minutes 160 \
+            --output fidelly_prospects.csv \
+            --push-sheets \
+            $EXTRA_ARGS
 
       - name: Job summary
         if: always()
@@ -138,5 +172,6 @@ jobs:
             fidelly_prospects.csv
             fidelly_prospects.summary.json
             fidelly_prospects.pending.json
+            business_categories.json
           if-no-files-found: ignore
           retention-days: 30

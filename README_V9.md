@@ -1,4 +1,4 @@
-# Fidelly V9 New-First
+# Fidelly V9.1 New-First
 
 Priorité du moteur :
 
@@ -11,11 +11,45 @@ Priorité du moteur :
 7. Les anciens ACTIONABLE / COMPLETE sont ignorés par défaut.
 8. `force_refresh=true` permet volontairement de retraiter l'historique.
 9. Paris, Lyon et Marseille peuvent être saisis par arrondissement.
+10. Le mode `all_businesses` utilise la nomenclature NAF rév. 2 complète (732 sous-classes) pour ne plus avoir à saisir les métiers à la main.
+
+## Mode recommandé : tous les métiers
+
+Dans **GitHub Actions > Fidelly Prospection V9 New-First > Run workflow** :
+
+- renseigner `zones` ;
+- laisser **Scanner tous les métiers (732 activités NAF)** activé ;
+- laisser `keywords` vide ;
+- choisir l'objectif de nouveaux prospects par ville.
+
+Le workflow génère automatiquement `business_categories.json` depuis la nomenclature officielle INSEE puis lance :
+
+```bash
+python fidelly_prospect_finder_v9_new_first.py \
+  --zones-pipe "Lyon" \
+  --all-businesses \
+  --business-categories business_categories.json \
+  --target-new-per-zone 100 \
+  --push-sheets
+```
+
+`max_per_naf` limite le nombre de prospects retenus par activité NAF afin d'éviter qu'un secteur très dense monopolise tout le résultat.
+
+## Mode ciblé
+
+Pour rechercher seulement certains métiers, désactiver **Scanner tous les métiers** et remplir `keywords`, par exemple :
+
+```text
+restaurant|bar|caviste|coiffeur
+```
+
+## Exemple de volume
 
 Pour viser 500 nouveaux prospects dans une ville :
-- target_new_per_city = 500
-- pages = 5
-- discovery_multiplier = 8
-- max_enrich_per_run = 100
+
+- `target_new_per_city = 500`
+- `pages = 5` (mode ciblé)
+- `discovery_multiplier = 8`
+- `max_enrich_per_run = 100`
 
 Les nouveaux trouvés sont enregistrés rapidement dans Sheets. L'enrichissement lourd reste limité pour éviter les timeouts.

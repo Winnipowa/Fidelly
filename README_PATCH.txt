@@ -1,9 +1,9 @@
 Fidelly V9.1 - Tous les métiers
 
-Fichiers à remplacer/ajouter dans Winnipowa/Fidelly :
-- fidelly_prospect_finder_v9_new_first.py
-- build_business_categories.py
-- .github/workflows/fidelly-prospection.yml
+Intégré dans cette archive :
+- fidelly_prospect_finder_v9_new_first.py : support --all-businesses
+- build_business_categories.py : génération des 732 sous-classes NAF rév. 2
+- .github/workflows/fidelly-prospection.yml : option "Scanner tous les métiers" activée par défaut
+- README_V9.md : instructions actualisées
 
-Le workflow ajoute l'option "Scanner tous les métiers (732 activités NAF)" activée par défaut.
-Quand elle est activée, GitHub Actions génère business_categories.json depuis l'INSEE puis lance le V9.1 avec --all-businesses.
+Le workflow génère business_categories.json depuis l'INSEE avant le scan en mode tous métiers.
