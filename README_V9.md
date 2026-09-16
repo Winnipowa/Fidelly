@@ -53,3 +53,18 @@ Pour viser 500 nouveaux prospects dans une ville :
 - `max_enrich_per_run = 100`
 
 Les nouveaux trouvés sont enregistrés rapidement dans Sheets. L'enrichissement lourd reste limité pour éviter les timeouts.
+
+## V9.2 Fast Discovery
+
+V9.2 sépare la découverte de l'enrichissement :
+
+- les nouveaux prospects sont détectés puis enregistrés immédiatement dans Google Sheets ;
+- le scan NAF vérifie les doublons par lots et s'arrête dès que l'objectif de nouveaux prospects est atteint ;
+- les activités sont classées A/B/C pour éviter d'enrichir par défaut les profils peu commerciaux ;
+- seuls les profils A sont enrichis par défaut (option pour inclure B) ;
+- enrichissement web parallèle (`workers=8` par défaut) ;
+- recherche web courte : 1 requête, 2 moteurs maximum ;
+- timeout réduit à 7 secondes ;
+- Nominatim est retiré du chemin d'enrichissement rapide.
+
+Le workflow GitHub Actions appelle `fidelly_prospect_finder_v9_2_fast.py`.
