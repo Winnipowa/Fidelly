@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Fidelly autonomous email enricher.
+"""Fidelly autonomous email-first enricher.
 
-Scans existing prospects whose email is blank, searches public sources,
-validates identity, and writes only sufficiently reliable emails.
+Goal: maximize reliable public business emails found per unit of time.
 
-Preferred webhook actions (see apps_script/email_enrichment_patch.gs):
-  - list_missing_emails
-  - patch_email
-
-If list_missing_emails is not deployed yet, the bot falls back to rediscovering
-existing prospects in configured zones and uses the existing V8/V9 snapshot.
+Strategy:
+- take prospects with missing email from the existing Google Sheet;
+- prioritize prospects that already have an official website;
+- crawl official contact/legal pages first;
+- only then use a compact web search fallback;
+- validate business identity and the email domain;
+- run multiple enrichments in parallel;
+- write verified emails back to Google Sheets in batches.
 """
 from __future__ import annotations
 
@@ -19,9 +20,12 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import unicodedata
-from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -32,8 +36,9 @@ from bs4 import BeautifulSoup
 import fidelly_prospect_finder_v6_cloud as v6
 import fidelly_prospect_finder_v8_smart as core
 
-VERSION = "1.0"
-SOURCE_NAME = "fidelly-email-enricher"
+VERSION = "1.1-email-first"
+SOURCE_NAME = "fidelly-email-enricher-parallel"
+
 DEFAULT_ZONES = (
     "Issoudun|Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|"
     "Saint-Amand-Montrond|Lyon"
@@ -45,7 +50,9 @@ DEFAULT_KEYWORDS = (
     "opticien|photographe|salle de sport|tatoueur|toilettage"
 )
 
-EMAIL_RE = re.compile(r"(?i)(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w.-])")
+EMAIL_RE = re.compile(
+    r"(?i)(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w.-])"
+)
 GENERIC_MAIL_DOMAINS = {
     "gmail.com", "googlemail.com", "orange.fr", "wanadoo.fr", "hotmail.fr",
     "hotmail.com", "outlook.fr", "outlook.com", "live.fr", "yahoo.fr",
@@ -73,8 +80,17 @@ CONTACT_HINTS = (
     "mentions légales", "legal", "cgv", "cgu", "a-propos", "qui-sommes-nous",
 )
 
-SESSION = requests.Session()
-SESSION.headers.update(v6.BROWSER_HEADERS)
+_TLS = threading.local()
+
+
+def session() -> requests.Session:
+    """Use one HTTP session per worker thread."""
+    s = getattr(_TLS, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(v6.BROWSER_HEADERS)
+        _TLS.session = s
+    return s
 
 
 @dataclass
@@ -120,19 +136,24 @@ def sane_email(email: str) -> bool:
     return bool(d and "." in d and len(e) <= 254)
 
 
-def domain_resolves(email: str) -> bool:
-    d = domain(email)
+@lru_cache(maxsize=4096)
+def domain_resolves_host(d: str) -> bool:
     if not d:
         return False
     try:
         import dns.resolver  # type: ignore
-        return bool(list(dns.resolver.resolve(d, "MX", lifetime=4.0)))
+
+        return bool(list(dns.resolver.resolve(d, "MX", lifetime=2.5)))
     except Exception:
         try:
             socket.getaddrinfo(d, 443)
             return True
         except Exception:
             return False
+
+
+def domain_resolves(email: str) -> bool:
+    return domain_resolves_host(domain(email))
 
 
 def name_tokens(row: dict[str, Any]) -> list[str]:
@@ -150,6 +171,7 @@ def identity_score(row: dict[str, Any], text: str, url: str) -> tuple[int, list[
     pts, why = 0, []
     siret = re.sub(r"\D", "", norm(row.get("siret")))
     siren = re.sub(r"\D", "", norm(row.get("siren")))
+
     if siret and siret in digits:
         pts += 42
         why.append("SIRET")
@@ -170,6 +192,7 @@ def identity_score(row: dict[str, Any], text: str, url: str) -> tuple[int, list[
     if city and city in hay:
         pts += 10
         why.append("ville")
+
     postcode = re.sub(r"\D", "", norm(row.get("postcode")))
     if postcode and postcode in text:
         pts += 8
@@ -179,6 +202,7 @@ def identity_score(row: dict[str, Any], text: str, url: str) -> tuple[int, list[
     if address_words and sum(w in hay for w in address_words) >= min(2, len(address_words)):
         pts += 10
         why.append("adresse")
+
     return pts, why
 
 
@@ -203,6 +227,7 @@ def make_candidate(
 
     kind = classify_source(source, row)
     pts, why = identity_score(row, text, source)
+
     if kind == "official":
         pts += 48
         why.append("site officiel")
@@ -219,6 +244,7 @@ def make_candidate(
     source_domain = domain(source)
     email_domain = domain(email)
     known_domain = domain(norm(row.get("website")))
+
     if source_domain and email_domain == source_domain:
         pts += 28
         why.append("domaine=source")
@@ -228,6 +254,7 @@ def make_candidate(
     elif email_domain in GENERIC_MAIL_DOMAINS:
         pts += 2
         why.append("messagerie générique")
+
     if mailto:
         pts += 6
         why.append("mailto")
@@ -241,14 +268,21 @@ def make_candidate(
 
     if kind in {"directory", "social"} and pts < 70:
         return None
-    return Candidate(email, source, max(0, min(100, pts)), ", ".join(why), kind)
+
+    return Candidate(
+        email=email,
+        source=source,
+        score=max(0, min(100, pts)),
+        reason=", ".join(why),
+        source_kind=kind,
+    )
 
 
 def extract_page(
     row: dict[str, Any], url: str, timeout: int
 ) -> tuple[list[Candidate], list[str]]:
     try:
-        r = SESSION.get(url, timeout=timeout, allow_redirects=True)
+        r = session().get(url, timeout=timeout, allow_redirects=True)
         if r.status_code >= 400 or "html" not in r.headers.get("content-type", "").lower():
             return [], []
     except requests.RequestException:
@@ -265,14 +299,14 @@ def extract_page(
         if sane_email(e):
             mailtos.add(e)
 
-    emails = []
+    emails: list[str] = []
     for blob in (body, visible, v6.deobfuscate(visible)):
         for e in EMAIL_RE.findall(blob):
             e = v6.clean_email(e)
             if sane_email(e) and e not in emails:
                 emails.append(e)
 
-    candidates = []
+    candidates: list[Candidate] = []
     for e in emails[:12]:
         c = make_candidate(row, e, r.url, identity_text, e in mailtos)
         if c:
@@ -286,17 +320,20 @@ def extract_page(
             if full not in seen:
                 seen.add(full)
                 links.append(full)
+
     for p in ("/contact", "/nous-contacter", "/mentions-legales", "/cgv"):
         full = urljoin(r.url, p)
         if full not in seen:
             seen.add(full)
             links.append(full)
-    return candidates, links[:7]
+
+    return candidates, links[:6]
 
 
 def parse_results(html: str, engine: str) -> list[tuple[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
-    out = []
+    out: list[tuple[str, str]] = []
+
     if engine == "ddg":
         for block in soup.select(".result")[:10]:
             a = block.select_one("a.result__a")
@@ -307,15 +344,12 @@ def parse_results(html: str, engine: str) -> list[tuple[str, str]]:
                 href = unquote(parse_qs(urlparse(href).query).get("uddg", [""])[0])
             if href.startswith("http"):
                 out.append((href, block.get_text(" ", strip=True)))
+
     elif engine == "bing":
         for block in soup.select("li.b_algo")[:10]:
             a = block.select_one("h2 a")
             if a and a.get("href", "").startswith("http"):
                 out.append((a.get("href", ""), block.get_text(" ", strip=True)))
-    elif engine == "brave":
-        for a in soup.select('a[href^="http"]')[:70]:
-            text = a.parent.get_text(" ", strip=True) if a.parent else a.get_text(" ", strip=True)
-            out.append((a.get("href", ""), text))
 
     dedup, seen = [], set()
     for url, text in out:
@@ -323,90 +357,112 @@ def parse_results(html: str, engine: str) -> list[tuple[str, str]]:
         if key not in seen:
             seen.add(key)
             dedup.append((url, text))
-    return dedup[:10]
+
+    return dedup[:8]
 
 
 def web_results(row: dict[str, Any], timeout: int) -> list[tuple[str, str]]:
+    """Compact fallback: fewer searches, tuned for emails rather than general enrichment."""
     name = norm(row.get("name") or row.get("legal_name"))
     city = norm(row.get("city") or row.get("zone"))
     postcode = norm(row.get("postcode"))
     siret = norm(row.get("siret"))
+
     queries = [
         f'"{name}" "{city}" email',
-        f'"{name}" "{city}" contact',
-        f'"{name}" "{postcode}"',
+        f'"{name}" "{postcode}" contact',
     ]
     if siret:
-        queries.append(f'"{siret}" email')
+        queries.append(f'"{siret}"')
 
     engines = [
         ("ddg", v6.DDG_HTML_URL, {}),
         ("bing", v6.BING_URL, {"setlang": "fr-FR"}),
-        ("brave", v6.BRAVE_URL, {"source": "web"}),
     ]
+
     out, seen = [], set()
     for query in queries:
         for engine, endpoint, extra in engines:
             try:
-                r = SESSION.get(endpoint, params={"q": query, **extra}, timeout=timeout)
+                r = session().get(endpoint, params={"q": query, **extra}, timeout=timeout)
                 if r.status_code != 200:
                     continue
                 for url, text in parse_results(r.text, engine):
                     if url not in seen:
                         seen.add(url)
                         out.append((url, text))
-                if len(out) >= 12:
-                    return out[:12]
+                if len(out) >= 8:
+                    return out[:8]
             except requests.RequestException:
                 continue
-    return out[:12]
+
+    return out[:8]
 
 
 def enrich(row: dict[str, Any], min_score: int, timeout: int) -> Candidate | None:
-    candidates, visited = [], set()
+    candidates: list[Candidate] = []
+    visited: set[str] = set()
     website = norm(row.get("website"))
+
+    # EMAIL FIRST: official website before any search engine.
     if website and not v6.is_directory(website):
         queue = [v6.ensure_url(website)]
-        while queue and len(visited) < 7:
+        while queue and len(visited) < 4:
             url = queue.pop(0)
             if url in visited:
                 continue
             visited.add(url)
             found, links = extract_page(row, url, timeout)
             candidates.extend(found)
+
+            if candidates and max(c.score for c in candidates) >= 96:
+                break
             queue.extend(x for x in links if x not in visited)
 
+    # Only search the web if the official source did not already give a reliable email.
     if not candidates or max(c.score for c in candidates) < min_score:
-        for url, snippet in web_results(row, timeout):
+        for url, snippet in web_results(row, timeout)[:6]:
             for e in EMAIL_RE.findall(snippet):
                 c = make_candidate(row, e, url, snippet)
                 if c:
                     candidates.append(c)
+
             if url not in visited:
                 visited.add(url)
                 found, links = extract_page(row, url, timeout)
                 candidates.extend(found)
-                for link in links[:3]:
+
+                for link in links[:2]:
                     if link not in visited:
                         visited.add(link)
                         more, _ = extract_page(row, link, timeout)
                         candidates.extend(more)
+
             if candidates and max(c.score for c in candidates) >= 96:
                 break
 
     if not candidates:
         return None
-    grouped = {}
+
+    grouped: dict[str, list[Candidate]] = {}
     for c in candidates:
         grouped.setdefault(c.email.lower(), []).append(c)
-    ranked = []
+
+    ranked: list[Candidate] = []
     for group in grouped.values():
         best = max(group, key=lambda x: x.score)
         domains = {domain(x.source) for x in group if domain(x.source)}
         bonus = min(8, max(0, len(domains) - 1) * 4)
         ranked.append(
-            Candidate(best.email, best.source, min(100, best.score + bonus), best.reason, best.source_kind)
+            Candidate(
+                best.email,
+                best.source,
+                min(100, best.score + bonus),
+                best.reason,
+                best.source_kind,
+            )
         )
+
     ranked.sort(key=lambda c: (c.score, c.source_kind == "official"), reverse=True)
     return ranked[0] if ranked[0].score >= min_score else None
 
@@ -422,22 +478,24 @@ def sheet_call(payload: dict[str, Any], attempts: int = 3):
 
 
 def list_missing(limit: int):
-    # Le point de départ tourne toutes les 3 h pour ne pas retraiter toujours
-    # les mêmes lignes difficiles. Le patch Apps Script ramène ce curseur
-    # dans les bornes réelles du Sheet.
-    rotating_cursor = int(time.time() // (3 * 3600)) * max(1, limit)
+    rotating_cursor = int(time.time() // 3600) * max(1, limit)
     ok, result = sheet_call(
-        {"action": "list_missing_emails", "limit": max(1, min(200, limit)), "cursor": rotating_cursor},
+        {
+            "action": "list_missing_emails",
+            "limit": max(1, min(200, limit)),
+            "cursor": rotating_cursor,
+        },
         attempts=2,
     )
-    if ok and isinstance(result, dict):
+    if ok and isinstance(result, dict) and result.get("ok", True):
         return result.get("rows") or [], "sheet"
     return [], str(result)
 
 
 def snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     sirets = [norm(r.get("siret")) for r in rows if norm(r.get("siret"))]
-    out = {}
+    out: dict[str, dict[str, Any]] = {}
+
     for start in range(0, len(sirets), 150):
         ok, result = sheet_call(
             {"action": "snapshot", "sirets": sirets[start:start + 150], "touch": False},
@@ -448,11 +506,13 @@ def snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
                 siret = norm(row.get("siret"))
                 if siret:
                     out[siret] = row
+
     return out
 
 
 def fallback(zones_pipe: str, keywords_pipe: str, pages: int) -> list[dict[str, Any]]:
-    candidates = {}
+    candidates: dict[str, dict[str, Any]] = {}
+
     for zone in core.split_pipe(zones_pipe):
         try:
             communes = v6.resolve_zone(zone)
@@ -460,8 +520,10 @@ def fallback(zones_pipe: str, keywords_pipe: str, pages: int) -> list[dict[str, 
             continue
         if not communes:
             continue
+
         commune = communes[0]
         zone_name = commune.get("nom", zone)
+
         for postcode in (commune.get("codesPostaux") or [])[:3]:
             for keyword in core.split_pipe(keywords_pipe):
                 for naf in (v6.NAF_MAP.get(keyword.lower(), []) or [None]):
@@ -469,11 +531,19 @@ def fallback(zones_pipe: str, keywords_pipe: str, pages: int) -> list[dict[str, 
                         for item in v6.gov_search(postcode, keyword, naf, max(1, pages)):
                             siret = norm(item.get("siret"))
                             if siret and siret not in candidates:
-                                candidates[siret] = {"zone": zone_name, "keyword": keyword, **item}
+                                candidates[siret] = {
+                                    "zone": zone_name,
+                                    "keyword": keyword,
+                                    **item,
+                                }
                     except Exception:
                         continue
+
     existing = snapshot(list(candidates.values()))
-    return [r for r in existing.values() if norm(r.get("siret")) and not norm(r.get("email"))]
+    return [
+        r for r in existing.values()
+        if norm(r.get("siret")) and not norm(r.get("email"))
+    ]
 
 
 def safe_write(row: dict[str, Any], candidate: Candidate) -> tuple[bool, str]:
@@ -498,17 +568,17 @@ def safe_write(row: dict[str, Any], candidate: Candidate) -> tuple[bool, str]:
         },
         attempts=2,
     )
+
     if ok and isinstance(result, dict):
         if int(result.get("written", 0) or 0):
             return True, "patch_email"
         if int(result.get("skipped_existing", 0) or 0):
             return False, "déjà rempli (lock)"
 
-    # Temporary compatibility with the current V8/V9 webhook until the atomic
-    # Apps Script patch is deployed. Re-snapshot immediately before partial upsert.
     latest = snapshot([{"siret": siret}]).get(siret)
     if latest and norm(latest.get("email")):
         return False, "déjà rempli avant fallback"
+
     ok2, msg = core.push_rows(
         [{"siret": siret, "email": candidate.email, "email_source": candidate.source}],
         os.getenv("SHEETS_WEBHOOK_URL", ""),
@@ -519,16 +589,65 @@ def safe_write(row: dict[str, Any], candidate: Candidate) -> tuple[bool, str]:
 
 def save(report: dict[str, Any], path: str):
     Path(path).write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
 
+def batch_patch(
+    results: list[tuple[dict[str, Any], Candidate]],
+    chunk_size: int = 40,
+) -> tuple[int, int]:
+    """Write verified emails in atomic chunks through Apps Script."""
+    written = 0
+    skipped = 0
+
+    for start in range(0, len(results), max(1, chunk_size)):
+        chunk = results[start:start + max(1, chunk_size)]
+        updates = [
+            {
+                "siret": norm(row.get("siret")),
+                "email": candidate.email,
+                "email_source": candidate.source,
+                "confidence": candidate.score,
+                "reason": candidate.reason,
+            }
+            for row, candidate in chunk
+            if norm(row.get("siret"))
+        ]
+
+        if not updates:
+            continue
+
+        ok, payload = sheet_call(
+            {"action": "patch_email", "updates": updates},
+            attempts=3,
+        )
+
+        if ok and isinstance(payload, dict) and payload.get("ok", True):
+            written += int(payload.get("written", 0) or 0)
+            skipped += int(payload.get("skipped_existing", 0) or 0)
+            skipped += int(payload.get("not_found", 0) or 0)
+            continue
+
+        # Backward compatibility if the Apps Script batch route is unavailable.
+        for row, candidate in chunk:
+            ok2, _message = safe_write(row, candidate)
+            if ok2:
+                written += 1
+            else:
+                skipped += 1
+
+    return written, skipped
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="Fidelly autonomous email enricher")
-    p.add_argument("--batch-size", type=int, default=40)
+    p = argparse.ArgumentParser(description="Fidelly email-first autonomous enricher")
+    p.add_argument("--batch-size", type=int, default=200)
+    p.add_argument("--workers", type=int, default=12)
     p.add_argument("--min-confidence", type=int, default=80)
-    p.add_argument("--timeout", type=int, default=10)
-    p.add_argument("--max-runtime-minutes", type=int, default=50)
+    p.add_argument("--timeout", type=int, default=7)
+    p.add_argument("--max-runtime-minutes", type=int, default=45)
     p.add_argument("--fallback-zones", default=DEFAULT_ZONES)
     p.add_argument("--fallback-keywords", default=DEFAULT_KEYWORDS)
     p.add_argument("--fallback-pages", type=int, default=2)
@@ -538,73 +657,132 @@ def main() -> int:
 
     deadline = time.monotonic() + max(5, args.max_runtime_minutes) * 60
     min_score = max(65, min(100, args.min_confidence))
-    batch = max(1, min(150, args.batch_size))
+    batch = max(1, min(200, args.batch_size))
+    workers = max(1, min(20, args.workers))
+    timeout = max(4, min(15, args.timeout))
 
     rows, mode = list_missing(batch)
     if mode != "sheet":
         print("list_missing_emails indisponible -> fallback de redécouverte", flush=True)
-        rows = fallback(args.fallback_zones, args.fallback_keywords, args.fallback_pages)[:batch]
+        rows = fallback(
+            args.fallback_zones,
+            args.fallback_keywords,
+            args.fallback_pages,
+        )[:batch]
         mode = "fallback"
+
+    rows = [r for r in rows if not norm(r.get("email"))]
+
+    # Strongest email-yield signal first: an existing website.
+    rows.sort(
+        key=lambda r: (
+            bool(norm(r.get("website"))),
+            bool(norm(r.get("phone"))),
+            bool(norm(r.get("name"))),
+        ),
+        reverse=True,
+    )
 
     report = {
         "version": VERSION,
         "source": SOURCE_NAME,
         "started_at": core.utc_now_iso(),
         "mode": mode,
+        "batch_requested": batch,
+        "workers": workers,
         "scanned": 0,
         "found": 0,
         "written": 0,
         "skipped": 0,
+        "errors": 0,
+        "yield_percent": 0.0,
         "results": [],
     }
-    rows.sort(
-        key=lambda r: (bool(norm(r.get("website"))), bool(norm(r.get("phone")))),
-        reverse=True,
-    )
 
-    for i, row in enumerate(rows, 1):
-        if time.monotonic() >= deadline:
-            break
-        if norm(row.get("email")):
-            continue
-        report["scanned"] += 1
+    found: list[tuple[dict[str, Any], Candidate]] = []
+
+    if rows:
         print(
-            f"[{i}/{len(rows)}] {row.get('name')} — {row.get('city')} — {row.get('siret')}",
+            f"EMAIL-FIRST: {len(rows)} prospects | workers={workers} | timeout={timeout}s",
             flush=True,
         )
-        try:
-            candidate = enrich(row, min_score, max(5, args.timeout))
-        except Exception as exc:
-            print(f"  erreur isolée: {exc}", flush=True)
-            continue
-        if not candidate:
-            print("  aucun email assez fiable", flush=True)
-            continue
 
-        report["found"] += 1
-        entry = {
-            "siret": norm(row.get("siret")),
-            "name": norm(row.get("name")),
-            "city": norm(row.get("city")),
-            **asdict(candidate),
-        }
-        if args.dry_run:
-            entry["write"] = "dry-run"
-        else:
-            ok, message = safe_write(row, candidate)
-            entry["write"] = message
-            if ok:
-                report["written"] += 1
-            else:
-                report["skipped"] += 1
-        report["results"].append(entry)
-        save(report, args.report)
-        time.sleep(0.5)
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="fidelly-email",
+        ) as executor:
+            future_map = {
+                executor.submit(enrich, row, min_score, timeout): row
+                for row in rows
+            }
+
+            done_count = 0
+            for future in as_completed(future_map):
+                if time.monotonic() >= deadline:
+                    for f in future_map:
+                        f.cancel()
+                    break
+
+                row = future_map[future]
+                done_count += 1
+                report["scanned"] += 1
+
+                try:
+                    candidate = future.result()
+                except Exception as exc:
+                    report["errors"] += 1
+                    print(
+                        f"[{done_count}/{len(rows)}] erreur {row.get('name')}: {exc}",
+                        flush=True,
+                    )
+                    continue
+
+                if not candidate:
+                    print(
+                        f"[{done_count}/{len(rows)}] no-email {row.get('name')}",
+                        flush=True,
+                    )
+                    continue
+
+                report["found"] += 1
+                found.append((row, candidate))
+                report["results"].append({
+                    "siret": norm(row.get("siret")),
+                    "name": norm(row.get("name")),
+                    "city": norm(row.get("city")),
+                    **asdict(candidate),
+                    "write": "pending" if not args.dry_run else "dry-run",
+                })
+
+                print(
+                    f"[{done_count}/{len(rows)}] FOUND {candidate.email} | "
+                    f"{candidate.score}% | {row.get('name')}",
+                    flush=True,
+                )
+
+                if len(found) % 10 == 0:
+                    save(report, args.report)
+
+    if found and not args.dry_run:
+        written, skipped = batch_patch(found, chunk_size=40)
+        report["written"] = written
+        report["skipped"] = skipped
+        for entry in report["results"]:
+            entry["write"] = "batched"
+
+    if report["scanned"]:
+        report["yield_percent"] = round(
+            100.0 * report["found"] / report["scanned"],
+            2,
+        )
 
     report["finished_at"] = core.utc_now_iso()
     save(report, args.report)
+
     print(
-        f"done scanned={report['scanned']} found={report['found']} written={report['written']}",
+        f"done scanned={report['scanned']} found={report['found']} "
+        f"written={report['written']} yield={report['yield_percent']}% "
+        f"skipped={report['skipped']} errors={report['errors']}",
         flush=True,
     )
     return 0

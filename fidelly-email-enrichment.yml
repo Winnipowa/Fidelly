@@ -1,0 +1,105 @@
+name: Fidelly Email Enrichment — Email First
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Prospects sans email à traiter par run"
+        required: true
+        default: "200"
+      workers:
+        description: "Enrichissements web parallèles"
+        required: true
+        default: "12"
+      min_confidence:
+        description: "Score minimum avant écriture (65-100)"
+        required: true
+        default: "80"
+      fallback_zones:
+        description: "Zones fallback séparées par |"
+        required: false
+        default: "Issoudun|Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|Saint-Amand-Montrond|Lyon"
+      dry_run:
+        description: "Chercher sans écrire dans le Sheet"
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 * * * *"
+
+concurrency:
+  group: fidelly-email-enrichment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Enrich missing emails
+        env:
+          SHEETS_WEBHOOK_URL: ${{ secrets.SHEETS_WEBHOOK_URL }}
+          SHEETS_WEBHOOK_TOKEN: ${{ secrets.SHEETS_WEBHOOK_TOKEN }}
+          INPUT_BATCH: ${{ github.event.inputs.batch_size }}
+          INPUT_WORKERS: ${{ github.event.inputs.workers }}
+          INPUT_CONFIDENCE: ${{ github.event.inputs.min_confidence }}
+          INPUT_ZONES: ${{ github.event.inputs.fallback_zones }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        shell: bash
+        run: |
+          BATCH="${INPUT_BATCH:-200}"
+          WORKERS="${INPUT_WORKERS:-12}"
+          CONFIDENCE="${INPUT_CONFIDENCE:-80}"
+          ZONES="${INPUT_ZONES:-Issoudun|Bourges|Châteauroux|Vierzon|Romorantin-Lanthenay|Saint-Amand-Montrond|Lyon}"
+          EXTRA=""
+          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then
+            EXTRA="--dry-run"
+          fi
+
+          python fidelly_email_enricher.py \
+            --batch-size "$BATCH" \
+            --workers "$WORKERS" \
+            --min-confidence "$CONFIDENCE" \
+            --timeout 7 \
+            --max-runtime-minutes 45 \
+            --fallback-zones "$ZONES" \
+            --fallback-pages 2 \
+            --report fidelly_email_enrichment_report.json \
+            $EXTRA
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Fidelly Email Enrichment — Email First" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f fidelly_email_enrichment_report.json ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat fidelly_email_enrichment_report.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Aucun rapport généré." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fidelly-email-enrichment
+          path: fidelly_email_enrichment_report.json
+          if-no-files-found: ignore
+          retention-days: 30
